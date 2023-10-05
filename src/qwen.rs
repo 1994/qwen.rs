@@ -1,13 +1,16 @@
+use std::fmt::Debug;
 use std::ptr::null_mut;
 
 use bytemuck_derive::{Pod, Zeroable};
 use ggml_sys_bleedingedge::{
-    ggml_get_rows, ggml_init, ggml_init_params, ggml_new_tensor_1d, ggml_new_tensor_2d,
-    ggml_new_tensor_3d, GGML_OBJECT_SIZE, ggml_scratch, ggml_tensor, GGML_TENSOR_SIZE,
-    ggml_type, ggml_type_GGML_TYPE_F16, ggml_type_GGML_TYPE_F32, ggml_type_size,
+    ggml_add_inplace, ggml_get_rows, ggml_init, ggml_init_params, ggml_mul_inplace, ggml_mul_mat,
+    ggml_new_tensor_1d, ggml_new_tensor_2d, ggml_new_tensor_3d, ggml_rms_norm,
+    ggml_rms_norm_inplace, ggml_scratch, ggml_set_scratch, ggml_silu_inplace, ggml_tensor,
+    ggml_type, ggml_type_GGML_TYPE_F16, ggml_type_GGML_TYPE_F32, ggml_type_size, GGML_OBJECT_SIZE,
+    GGML_TENSOR_SIZE,
 };
 
-use crate::model::ModelContext;
+use crate::model::{ModelContext, ModelLoader};
 
 const MB: usize = 1024 * 1024;
 const MODEL_MEM_SIZE: usize = 512 * MB;
@@ -55,6 +58,7 @@ impl QwenTokenizer {
     }
 }
 
+#[derive(Debug)]
 struct QwenAttention {
     num_attention_heads: i64,
     num_kv_heads: i64,
@@ -99,8 +103,18 @@ impl QwenAttention {
             v_cache,
         }
     }
+
+    fn forward(
+        &self,
+        ctx: &ModelContext,
+        hidden_states: *mut ggml_tensor,
+        n_past: i32,
+    ) -> *mut ggml_tensor {
+        todo!()
+    }
 }
 
+#[derive(Debug)]
 struct QwenMLP {
     w1: Linear,
     w2: Linear,
@@ -115,8 +129,19 @@ impl QwenMLP {
             c_proj: Linear::new(ctx, intermediate_size / 2, hidden_size, false),
         }
     }
+    fn forward(&self, ctx: &ModelContext, hidden_states: *mut ggml_tensor) -> *mut ggml_tensor {
+        let cb = ctx.ctx_b.unwrap();
+        let mut a2 = self.w2.forward(ctx, hidden_states);
+        a2 = unsafe { ggml_silu_inplace(cb, a2) };
+
+        let a1 = self.w1.forward(ctx, hidden_states);
+        let output = unsafe { ggml_mul_inplace(cb, a2, a1) };
+
+        self.c_proj.forward(ctx, output)
+    }
 }
 
+#[derive(Debug)]
 struct QwenBlock {
     ln_1: RMSNorm,
     attn: QwenAttention,
@@ -146,8 +171,28 @@ impl QwenBlock {
             mlp: QwenMLP::new(ctx, hidden_size, intermediate_size),
         }
     }
+
+    fn forward(
+        &self,
+        ctx: &ModelContext,
+        hidden_states: *mut ggml_tensor,
+        n_past: i32,
+    ) -> *mut ggml_tensor {
+        let cb = ctx.ctx_b.unwrap();
+        let mut residual = hidden_states;
+        let mut temp = hidden_states;
+        temp = self.ln_1.forward(ctx, temp, 1e-6);
+        temp = self.attn.forward(ctx, temp, n_past);
+        temp = unsafe { ggml_add_inplace(cb, hidden_states, residual) };
+
+        residual = temp;
+        temp = self.ln_2.forward(ctx, temp, 1e-6);
+        temp = self.mlp.forward(ctx, temp);
+        unsafe { ggml_add_inplace(cb, temp, residual) }
+    }
 }
 
+#[derive(Debug)]
 pub struct QwenModel {
     wte: Embedding,
     layers: Vec<QwenBlock>,
@@ -156,7 +201,6 @@ pub struct QwenModel {
 
 impl QwenModel {
     fn new(ctx: &ModelContext, config: &QwenConfig) -> Self {
-        let l = config.num_hidden_layers;
         let mut layers: Vec<QwenBlock> = Vec::with_capacity(config.num_hidden_layers as usize);
         for i in 0..config.num_hidden_layers {
             layers.push(QwenBlock::new(
@@ -174,8 +218,25 @@ impl QwenModel {
             ln_f: RMSNorm::new(ctx, config.hidden_size as i64, true),
         }
     }
+
+    fn forward(
+        &self,
+        ctx: &ModelContext,
+        input_ids: *mut ggml_tensor,
+        n_past: i32,
+    ) -> *mut ggml_tensor {
+        let cb = ctx.ctx_b.unwrap();
+        let mut hidden_states = self.wte.forward(ctx, input_ids);
+        for layer in &self.layers {
+            unsafe {
+                ggml_set_scratch(cb, ctx.scratch);
+            }
+        }
+        todo!()
+    }
 }
 
+#[derive(Debug)]
 pub struct QwenForCausalLM {
     ctx: ModelContext,
     state_dict: Vec<(String, *mut ggml_tensor)>,
@@ -213,8 +274,6 @@ impl QwenForCausalLM {
             })
         };
 
-
-
         let compute_buffer = vec!['0'; MODEL_MEM_SIZE];
         let mut scratch_buffer = vec!['0'; MODEL_SCRATCH_SIZE];
 
@@ -236,7 +295,12 @@ impl QwenForCausalLM {
             work_buffer: vec![],
         };
         let model = QwenModel::new(&context, config);
-        let l = Linear::new(&context, config.hidden_size as i64, config.vocab_size as i64, false);
+        let l = Linear::new(
+            &context,
+            config.hidden_size as i64,
+            config.vocab_size as i64,
+            false,
+        );
 
         let mut dict: Vec<(String, *mut ggml_tensor)> =
             Vec::with_capacity(3 + config.num_hidden_layers as usize * 8);
@@ -245,14 +309,38 @@ impl QwenForCausalLM {
         for i in 0..config.num_hidden_layers {
             let layer_prefix = format!("transformer.h.{}.", i);
             let index = i as usize;
-            dict.push((format!("{}ln_1.weight", layer_prefix), model.layers[index].ln_1.weight));
-            dict.push((format!("{}attn.c_attn.weight", layer_prefix), model.layers[index].attn.c_attn.weight));
-            dict.push((format!("{}attn.c_attn.bias", layer_prefix), model.layers[index].attn.c_attn.bias.unwrap_or(null_mut())));
-            dict.push((format!("{}attn.c_proj.weight", layer_prefix), model.layers[index].attn.c_proj.weight));
-            dict.push((format!("{}ln_2.weight", layer_prefix), model.layers[index].ln_2.weight));
-            dict.push((format!("{}mlp.w1.weight", layer_prefix), model.layers[index].mlp.w1.weight));
-            dict.push((format!("{}mlp.w2.weight", layer_prefix), model.layers[index].mlp.w2.weight));
-            dict.push((format!("{}mlp.c_proj.weight", layer_prefix), model.layers[index].mlp.c_proj.weight));
+            dict.push((
+                format!("{}ln_1.weight", layer_prefix),
+                model.layers[index].ln_1.weight,
+            ));
+            dict.push((
+                format!("{}attn.c_attn.weight", layer_prefix),
+                model.layers[index].attn.c_attn.weight,
+            ));
+            dict.push((
+                format!("{}attn.c_attn.bias", layer_prefix),
+                model.layers[index].attn.c_attn.bias.unwrap_or(null_mut()),
+            ));
+            dict.push((
+                format!("{}attn.c_proj.weight", layer_prefix),
+                model.layers[index].attn.c_proj.weight,
+            ));
+            dict.push((
+                format!("{}ln_2.weight", layer_prefix),
+                model.layers[index].ln_2.weight,
+            ));
+            dict.push((
+                format!("{}mlp.w1.weight", layer_prefix),
+                model.layers[index].mlp.w1.weight,
+            ));
+            dict.push((
+                format!("{}mlp.w2.weight", layer_prefix),
+                model.layers[index].mlp.w2.weight,
+            ));
+            dict.push((
+                format!("{}mlp.c_proj.weight", layer_prefix),
+                model.layers[index].mlp.c_proj.weight,
+            ));
         }
         dict.push(("transformer.ln_f.weight".to_owned(), model.ln_f.weight));
         dict.push(("lm_head.weight".to_owned(), l.weight));
@@ -265,8 +353,12 @@ impl QwenForCausalLM {
             lm_head: l,
         }
     }
+    fn load(&self, loader: &ModelLoader) {
+        todo!()
+    }
 }
 
+#[derive(Debug)]
 pub struct Linear {
     weight: *mut ggml_tensor,
     bias: Option<*mut ggml_tensor>,
@@ -288,11 +380,16 @@ impl Linear {
         Linear { weight, bias }
     }
 
-    fn forward(&self) -> *mut ggml_tensor {
-        todo!()
+    fn forward(&self, ctx: &ModelContext, input: *mut ggml_tensor) -> *mut ggml_tensor {
+        let mut output = unsafe { ggml_mul_mat(ctx.ctx_b.unwrap(), self.weight, input) };
+        if self.bias.is_some() {
+            output = unsafe { ggml_add_inplace(ctx.ctx_b.unwrap(), output, self.bias.unwrap()) };
+        }
+        output
     }
 }
 
+#[derive(Debug)]
 struct RMSNorm {
     weight: *mut ggml_tensor,
     inplace: bool,
@@ -303,8 +400,20 @@ impl RMSNorm {
         let w = unsafe { ggml_new_tensor_1d(ctx.ctx_w, ggml_type_GGML_TYPE_F32, normalized_shape) };
         RMSNorm { weight: w, inplace }
     }
+
+    fn forward(&self, ctx: &ModelContext, input: *mut ggml_tensor, eps: f32) -> *mut ggml_tensor {
+        let cb = ctx.ctx_b.unwrap();
+
+        let output = if self.inplace {
+            unsafe { ggml_rms_norm_inplace(cb, input, eps) }
+        } else {
+            unsafe { ggml_rms_norm(cb, input, eps) }
+        };
+        unsafe { ggml_mul_inplace(cb, output, self.weight) }
+    }
 }
 
+#[derive(Debug)]
 struct Embedding {
     weight: *mut ggml_tensor,
 }

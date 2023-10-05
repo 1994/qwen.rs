@@ -7,6 +7,7 @@ use bytemuck::{Pod, Zeroable};
 use ggml_sys_bleedingedge::{ggml_cgraph, ggml_context, ggml_scratch, ggml_tensor, ggml_type};
 use memmap2::Mmap;
 
+#[derive(Debug)]
 pub struct ModelContext {
     pub dtype: ggml_type,
     pub ctx_w: *mut ggml_context,
