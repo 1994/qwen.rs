@@ -11,13 +11,13 @@ use bytemuck_derive::{Pod, Zeroable};
 use ggml_sys_bleedingedge::{
     ggml_add_inplace, ggml_backend_GGML_BACKEND_CPU, ggml_build_forward_expand, ggml_cgraph,
     ggml_cont, ggml_cpu_has_blas, ggml_cpu_has_gpublas, ggml_cpy, ggml_diag_mask_inf_inplace,
-    ggml_element_size, ggml_get_rows, ggml_graph_compute, ggml_graph_plan, ggml_init,
-    ggml_init_params, ggml_mul_inplace, ggml_mul_mat, ggml_nbytes, ggml_new_f32,
-    ggml_new_tensor_1d, ggml_new_tensor_2d, ggml_new_tensor_3d, ggml_permute, ggml_reshape_2d,
-    ggml_reshape_3d, ggml_rms_norm, ggml_rms_norm_inplace, ggml_rope_inplace, ggml_scale_inplace,
-    ggml_scratch, ggml_set_scratch, ggml_silu_inplace, ggml_soft_max_inplace, ggml_tensor,
-    ggml_type, ggml_type_GGML_TYPE_F16, ggml_type_GGML_TYPE_F32, ggml_type_GGML_TYPE_I32,
-    ggml_type_size, ggml_view_1d, ggml_view_3d, GGML_OBJECT_SIZE, GGML_TENSOR_SIZE,
+    ggml_element_size, ggml_get_rows, ggml_init, ggml_init_params, ggml_mul_inplace, ggml_mul_mat,
+    ggml_nbytes, ggml_new_f32, ggml_new_tensor_1d, ggml_new_tensor_2d, ggml_new_tensor_3d,
+    ggml_permute, ggml_reshape_2d, ggml_reshape_3d, ggml_rms_norm, ggml_rms_norm_inplace,
+    ggml_rope_inplace, ggml_scale_inplace, ggml_scratch, ggml_set_scratch, ggml_silu_inplace,
+    ggml_soft_max_inplace, ggml_tensor, ggml_type, ggml_type_GGML_TYPE_F16,
+    ggml_type_GGML_TYPE_F32, ggml_type_GGML_TYPE_I32, ggml_type_size, ggml_view_1d, ggml_view_3d,
+    GGML_OBJECT_SIZE, GGML_TENSOR_SIZE,
 };
 use tiktoken_rs::CoreBPE;
 
@@ -91,7 +91,7 @@ impl QwenTokenizer {
     }
 
     pub fn decode(&self, ids: Vec<usize>) -> anyhow::Result<String> {
-        let p:Vec<usize> = ids
+        let p: Vec<usize> = ids
             .into_iter()
             .filter(|id| {
                 *id != self.im_start_id as usize
@@ -99,8 +99,8 @@ impl QwenTokenizer {
                     && *id != self.eos_token_id as usize
             })
             .collect();
-        if p.is_empty() { 
-            return Ok("".to_owned())
+        if p.is_empty() {
+            return Ok("".to_owned());
         }
         self.bpe.decode(p)
     }
