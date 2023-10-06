@@ -3,9 +3,17 @@ use std::fmt::Debug;
 use std::ptr::null_mut;
 
 use bytemuck_derive::{Pod, Zeroable};
-use ggml_sys_bleedingedge::{ggml_add_inplace, ggml_cont, ggml_element_size, ggml_get_rows, ggml_init, ggml_init_params, ggml_mul_inplace, ggml_mul_mat, ggml_new_tensor_1d, ggml_new_tensor_2d, ggml_new_tensor_3d, ggml_permute, ggml_reshape_3d, ggml_rms_norm, ggml_rms_norm_inplace, ggml_rope_inplace, ggml_scratch, ggml_set_scratch, ggml_silu_inplace, ggml_tensor, ggml_type, ggml_type_GGML_TYPE_F16, ggml_type_GGML_TYPE_F32, ggml_type_size, ggml_view_3d, GGML_OBJECT_SIZE, GGML_TENSOR_SIZE, ggml_build_forward_expand, ggml_cpy};
+use ggml_sys_bleedingedge::{
+    ggml_add_inplace, ggml_build_forward_expand, ggml_cont, ggml_cpy, ggml_diag_mask_inf_inplace,
+    ggml_element_size, ggml_get_rows, ggml_init, ggml_init_params, ggml_mul_inplace, ggml_mul_mat,
+    ggml_new_f32, ggml_new_tensor_1d, ggml_new_tensor_2d, ggml_new_tensor_3d, ggml_permute,
+    ggml_reshape_2d, ggml_reshape_3d, ggml_rms_norm, ggml_rms_norm_inplace, ggml_rope_inplace,
+    ggml_scale_inplace, ggml_scratch, ggml_set_scratch, ggml_silu_inplace, ggml_soft_max_inplace,
+    ggml_tensor, ggml_type, ggml_type_GGML_TYPE_F16, ggml_type_GGML_TYPE_F32, ggml_type_size,
+    ggml_view_1d, ggml_view_3d, GGML_OBJECT_SIZE, GGML_TENSOR_SIZE,
+};
 
-use crate::model::{ModelContext, ModelLoader};
+use crate::model::ModelContext;
 
 const MB: usize = 1024 * 1024;
 const MODEL_MEM_SIZE: usize = 512 * MB;
@@ -37,11 +45,7 @@ struct QwenTokenizer {
 
 impl QwenTokenizer {
     fn new(path: &str, config: &QwenConfig) -> Self {
-        QwenTokenizer {
-            eos_token_id: 0,
-            im_start_id: 0,
-            im_end_id: 0,
-        }
+        todo!()
     }
 
     fn encode(&self, text: &str) -> Vec<i32> {
@@ -103,7 +107,7 @@ impl QwenAttention {
         &self,
         ctx: &ModelContext,
         hidden_states: *mut ggml_tensor,
-        n_past: i32,
+        n_past: i64,
     ) -> *mut ggml_tensor {
         let cb = ctx.ctx_b.unwrap();
         let hidden_size = unsafe { (*hidden_states).ne[0] };
@@ -127,7 +131,7 @@ impl QwenAttention {
             )
         };
         query_layer =
-            unsafe { ggml_rope_inplace(cb, query_layer, n_past, rope_dim as c_int, 2, 0) };
+            unsafe { ggml_rope_inplace(cb, query_layer, n_past as c_int, rope_dim as c_int, 2, 0) };
         query_layer = unsafe {
             let p = ggml_permute(cb, query_layer, 0, 2, 1, 3);
             ggml_cont(cb, p)
@@ -155,7 +159,8 @@ impl QwenAttention {
                 hidden_size as usize * qkv_size,
             )
         };
-        key_layer = unsafe { ggml_rope_inplace(cb, key_layer, n_past, rope_dim as c_int, 2, 0) };
+        key_layer =
+            unsafe { ggml_rope_inplace(cb, key_layer, n_past as c_int, rope_dim as c_int, 2, 0) };
         key_layer = unsafe { ggml_permute(cb, key_layer, 0, 2, 1, 3) };
 
         let mut value_layer = unsafe {
@@ -173,9 +178,9 @@ impl QwenAttention {
         };
         value_layer = unsafe { ggml_permute(cb, value_layer, 1, 2, 0, 3) };
 
-        let k_cache_view = unsafe {
+        unsafe {
             let k_cache_size = ggml_element_size(self.k_cache);
-            ggml_view_3d(
+            let k_cache_view = ggml_view_3d(
                 cb,
                 self.k_cache,
                 head_size,
@@ -184,17 +189,95 @@ impl QwenAttention {
                 (*self.k_cache).nb[1],
                 (*self.k_cache).nb[2],
                 n_past as usize * head_size as usize * k_cache_size,
-            )
-        };
+            );
 
-        unsafe {
             let cpy = ggml_cpy(cb, key_layer, k_cache_view);
             // todo gf init?
             ggml_build_forward_expand(ctx.gf.unwrap(), cpy)
+        };
+
+        unsafe {
+            let v_cache_size = ggml_element_size(self.v_cache);
+            let v_cache_view = ggml_view_3d(
+                cb,
+                self.v_cache,
+                qlen,
+                head_size,
+                self.num_kv_heads,
+                (*self.v_cache).nb[1],
+                (*self.v_cache).nb[2],
+                n_past as usize * v_cache_size,
+            );
+
+            let cpy = ggml_cpy(cb, value_layer, v_cache_view);
+            ggml_build_forward_expand(ctx.gf.unwrap(), cpy);
         }
 
+        key_layer = unsafe {
+            ggml_view_3d(
+                cb,
+                self.k_cache,
+                head_size,
+                n_past + qlen,
+                self.num_kv_heads,
+                (*self.k_cache).nb[1],
+                (*self.k_cache).nb[2],
+                0,
+            )
+        };
 
-        todo!()
+        value_layer = unsafe {
+            ggml_view_3d(
+                cb,
+                self.v_cache,
+                n_past + qlen,
+                head_size,
+                self.num_kv_heads,
+                (*self.v_cache).nb[1],
+                (*self.v_cache).nb[2],
+                0,
+            )
+        };
+        let mut atten_scores = unsafe { ggml_mul_mat(cb, key_layer, query_layer) };
+
+        atten_scores = unsafe {
+            let v = ggml_new_f32(cb, 1. / (head_size as f32).sqrt());
+            ggml_scale_inplace(cb, atten_scores, v)
+        };
+
+        if n_past == 0 {
+            unsafe {
+                atten_scores = ggml_reshape_3d(
+                    cb,
+                    atten_scores,
+                    n_past + qlen,
+                    qlen,
+                    self.num_attention_heads,
+                );
+                atten_scores = ggml_diag_mask_inf_inplace(cb, atten_scores, n_past as c_int);
+                atten_scores = ggml_reshape_3d(
+                    cb,
+                    atten_scores,
+                    n_past + qlen,
+                    mqa_scale * qlen,
+                    self.num_kv_heads,
+                );
+            }
+        }
+        let attn_probs = unsafe { ggml_soft_max_inplace(cb, atten_scores) };
+
+        let mut context_layer = unsafe { ggml_mul_mat(cb, value_layer, attn_probs) };
+
+        context_layer = unsafe {
+            ggml_reshape_3d(cb, context_layer, head_size, qlen, self.num_attention_heads)
+        };
+
+        context_layer = unsafe {
+            let v = ggml_permute(cb, context_layer, 0, 2, 1, 3);
+            ggml_cont(cb, v)
+        };
+        context_layer = unsafe { ggml_reshape_2d(cb, context_layer, hidden_size, qlen) };
+        self.c_proj.forward(ctx, context_layer)
     }
 }
 
@@ -260,7 +343,7 @@ impl QwenBlock {
         &self,
         ctx: &ModelContext,
         hidden_states: *mut ggml_tensor,
-        n_past: i32,
+        n_past: i64,
     ) -> *mut ggml_tensor {
         let cb = ctx.ctx_b.unwrap();
         let mut residual = hidden_states;
@@ -272,7 +355,8 @@ impl QwenBlock {
         residual = temp;
         temp = self.ln_2.forward(ctx, temp, 1e-6);
         temp = self.mlp.forward(ctx, temp);
-        unsafe { ggml_add_inplace(cb, temp, residual) }
+        temp = unsafe { ggml_add_inplace(cb, temp, residual) };
+        temp
     }
 }
 
@@ -286,7 +370,7 @@ pub struct QwenModel {
 impl QwenModel {
     fn new(ctx: &ModelContext, config: &QwenConfig) -> Self {
         let mut layers: Vec<QwenBlock> = Vec::with_capacity(config.num_hidden_layers as usize);
-        for i in 0..config.num_hidden_layers {
+        for _ in 0..config.num_hidden_layers {
             layers.push(QwenBlock::new(
                 ctx,
                 config.hidden_size as i64,
@@ -307,7 +391,7 @@ impl QwenModel {
         &self,
         ctx: &ModelContext,
         input_ids: *mut ggml_tensor,
-        n_past: i32,
+        n_past: i64,
     ) -> *mut ggml_tensor {
         let cb = ctx.ctx_b.unwrap();
         let mut hidden_states = self.wte.forward(ctx, input_ids);
@@ -315,8 +399,18 @@ impl QwenModel {
             unsafe {
                 ggml_set_scratch(cb, ctx.scratch);
             }
+            hidden_states = layer.forward(ctx, hidden_states, n_past);
         }
-        todo!()
+
+        unsafe {
+            let empty = ggml_scratch {
+                offs: 0,
+                size: 0,
+                data: null_mut(),
+            };
+            ggml_set_scratch(cb, empty);
+        };
+        self.ln_f.forward(ctx, hidden_states, 1e-6)
     }
 }
 
@@ -352,7 +446,7 @@ impl QwenForCausalLM {
 
         let ctx_kv = unsafe {
             ggml_init(ggml_init_params {
-                mem_size: ctx_kv_size + 1 * MB,
+                mem_size: ctx_kv_size + MB,
                 mem_buffer: null_mut(),
                 no_alloc: false,
             })
@@ -437,9 +531,31 @@ impl QwenForCausalLM {
             lm_head: l,
         }
     }
-    fn load(&self, loader: &ModelLoader) {
-        todo!()
+    fn forward(
+        &self,
+        ctx: &ModelContext,
+        input_ids: *mut ggml_tensor,
+        n_past: i64,
+        // n_ctx: i32,
+    ) -> *mut ggml_tensor {
+        let mut output = self.transformer.forward(ctx, input_ids, n_past);
+        unsafe {
+            if (*input_ids).ne[0] > 1 {
+                let output_size = ggml_element_size(output);
+                output = ggml_view_1d(
+                    ctx.ctx_b.unwrap(),
+                    output,
+                    self.config.hidden_size as i64,
+                    ((*input_ids).ne[0] - 1) as usize
+                        * self.config.hidden_size as usize
+                        * output_size,
+                );
+            }
+        }
+        self.lm_head.forward(ctx, output)
     }
+
+    fn generate_next_token(&self) {}
 }
 
 #[derive(Debug)]
@@ -487,8 +603,8 @@ impl RMSNorm {
 
     fn forward(&self, ctx: &ModelContext, input: *mut ggml_tensor, eps: f32) -> *mut ggml_tensor {
         let cb = ctx.ctx_b.unwrap();
-
-        let output = if self.inplace {
+        let inplace = self.inplace;
+        let output = if inplace {
             unsafe { ggml_rms_norm_inplace(cb, input, eps) }
         } else {
             unsafe { ggml_rms_norm(cb, input, eps) }

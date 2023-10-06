@@ -84,3 +84,29 @@ impl MappedFile {
 }
 
 struct Pipeline {}
+
+#[derive(Debug)]
+struct GenerationConfig {
+    max_length: i64,
+    do_sample: bool,
+    top_k: i32,
+    top_p: f32,
+    temperature: f32,
+    repetition_penalty: f32,
+    num_threads: i32,
+}
+
+impl Default for GenerationConfig {
+    fn default() -> Self {
+        let cpus = num_cpus::get_physical();
+        GenerationConfig {
+            max_length: 2048,
+            do_sample: true,
+            top_k: 0,
+            top_p: 0.7,
+            temperature: 0.95,
+            repetition_penalty: 1.,
+            num_threads: cpus as i32,
+        }
+    }
+}
