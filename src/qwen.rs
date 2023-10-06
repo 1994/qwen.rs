@@ -1,7 +1,11 @@
+use std::collections::HashMap;
 use std::ffi::c_int;
 use std::fmt::Debug;
+use std::fs;
 use std::ptr::null_mut;
 
+use base64::engine::general_purpose;
+use base64::Engine;
 use bytemuck_derive::{Pod, Zeroable};
 use ggml_sys_bleedingedge::{
     ggml_add_inplace, ggml_build_forward_expand, ggml_cont, ggml_cpy, ggml_diag_mask_inf_inplace,
@@ -12,12 +16,14 @@ use ggml_sys_bleedingedge::{
     ggml_tensor, ggml_type, ggml_type_GGML_TYPE_F16, ggml_type_GGML_TYPE_F32, ggml_type_size,
     ggml_view_1d, ggml_view_3d, GGML_OBJECT_SIZE, GGML_TENSOR_SIZE,
 };
+use tiktoken_rs::CoreBPE;
 
 use crate::model::ModelContext;
 
 const MB: usize = 1024 * 1024;
 const MODEL_MEM_SIZE: usize = 512 * MB;
 const MODEL_SCRATCH_SIZE: usize = 1280 * MB;
+const TOKEN_REGEX: &str = r"((?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?:$|[^\S])|\s+)";
 
 #[repr(C)]
 #[derive(Debug, Copy, Clone, Default, Pod, Zeroable)]
@@ -36,24 +42,61 @@ pub struct QwenConfig {
     im_end_id: i32,
 }
 
-#[derive(Default, Debug)]
-struct QwenTokenizer {
+#[derive(Debug)]
+pub struct QwenTokenizer {
     eos_token_id: i32,
     im_start_id: i32,
     im_end_id: i32,
+    bpe: CoreBPE,
 }
 
 impl QwenTokenizer {
-    fn new(path: &str, config: &QwenConfig) -> Self {
-        todo!()
+    pub fn new(path: &str, config: &QwenConfig) -> anyhow::Result<Self> {
+        let file = fs::read_to_string(path)?;
+        let mut encoder = HashMap::default();
+        for line in file.lines() {
+            let (left, right) = parse(line)?;
+            encoder.insert(left, right);
+        }
+
+        let mut special_tokens_s = vec![
+            "<|endoftext|>".to_owned(),
+            "<|im_start|>".to_owned(),
+            "<|im_end|>".to_owned(),
+        ];
+        for i in 0..205 {
+            let v = format!("<|extra_{}|>", i);
+            special_tokens_s.push(v);
+        }
+        let mut special_tokens = HashMap::default();
+        let encoder_size = encoder.len();
+        for (i, token) in special_tokens_s.iter().enumerate() {
+            special_tokens.insert(token.clone(), encoder_size + i);
+        }
+
+        let bpe = CoreBPE::new(encoder, special_tokens, TOKEN_REGEX)?;
+        Ok(QwenTokenizer {
+            eos_token_id: config.eos_token_id,
+            im_start_id: config.im_start_id,
+            im_end_id: config.im_end_id,
+            bpe,
+        })
     }
 
-    fn encode(&self, text: &str) -> Vec<i32> {
-        todo!()
+    pub fn encode(&self, text: &str) -> Vec<usize> {
+        self.bpe.encode_with_special_tokens(text)
     }
 
-    fn decode(&self, ids: &Vec<i32>) -> String {
-        todo!()
+    pub fn decode(&self, ids: Vec<usize>) -> String {
+        let p = ids
+            .into_iter()
+            .filter(|id| {
+                *id != self.im_start_id as usize
+                    && *id != self.im_end_id as usize
+                    && *id != self.eos_token_id as usize
+            })
+            .collect();
+        self.bpe.decode(p).expect("decode error")
     }
 }
 
@@ -627,4 +670,12 @@ impl Embedding {
     fn forward(&self, ctx: &ModelContext, input: *mut ggml_tensor) -> *mut ggml_tensor {
         unsafe { ggml_get_rows(ctx.ctx_b.unwrap(), self.weight, input) }
     }
+}
+
+fn parse(line: &str) -> anyhow::Result<(Vec<u8>, usize)> {
+    let v: Vec<&str> = line.split(' ').collect();
+    let left = v[0];
+    let decode = general_purpose::STANDARD.decode(left)?;
+    let value = v[1].parse::<usize>()?;
+    Ok((decode, value))
 }

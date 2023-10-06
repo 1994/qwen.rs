@@ -8,9 +8,12 @@ name = "qwen"
 path = "src/main.rs"
 
 [dependencies]
+anyhow = "1.0.75"
+base64 = "0.21.4"
 bytemuck = "1.14.0"
 bytemuck_derive = "1.5.0"
 ggml-sys-bleedingedge = "2309131812.0.0+llamacpp-release.b1221"
 memmap2 = "0.9.0"
 num_cpus = "1.16.0"
 tiktoken-rs = "0.5.4"
+log = "0.4.20"
