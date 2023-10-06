@@ -13,7 +13,7 @@ pub struct ModelContext {
     pub ctx_w: *mut ggml_context,
     pub ctx_kv: *mut ggml_context,
     pub ctx_b: Option<*mut ggml_context>,
-    pub(crate) gf: Option<ggml_cgraph>,
+    pub(crate) gf: Option<*mut ggml_cgraph>,
     pub(crate) scratch: ggml_scratch,
     pub(crate) compute_buffer: Vec<char>,
     pub(crate) scratch_buffer: Vec<char>,

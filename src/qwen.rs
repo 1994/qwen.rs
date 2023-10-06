@@ -1,14 +1,9 @@
+use std::ffi::c_int;
 use std::fmt::Debug;
 use std::ptr::null_mut;
 
 use bytemuck_derive::{Pod, Zeroable};
-use ggml_sys_bleedingedge::{
-    ggml_add_inplace, ggml_get_rows, ggml_init, ggml_init_params, ggml_mul_inplace, ggml_mul_mat,
-    ggml_new_tensor_1d, ggml_new_tensor_2d, ggml_new_tensor_3d, ggml_rms_norm,
-    ggml_rms_norm_inplace, ggml_scratch, ggml_set_scratch, ggml_silu_inplace, ggml_tensor,
-    ggml_type, ggml_type_GGML_TYPE_F16, ggml_type_GGML_TYPE_F32, ggml_type_size, GGML_OBJECT_SIZE,
-    GGML_TENSOR_SIZE,
-};
+use ggml_sys_bleedingedge::{ggml_add_inplace, ggml_cont, ggml_element_size, ggml_get_rows, ggml_init, ggml_init_params, ggml_mul_inplace, ggml_mul_mat, ggml_new_tensor_1d, ggml_new_tensor_2d, ggml_new_tensor_3d, ggml_permute, ggml_reshape_3d, ggml_rms_norm, ggml_rms_norm_inplace, ggml_rope_inplace, ggml_scratch, ggml_set_scratch, ggml_silu_inplace, ggml_tensor, ggml_type, ggml_type_GGML_TYPE_F16, ggml_type_GGML_TYPE_F32, ggml_type_size, ggml_view_3d, GGML_OBJECT_SIZE, GGML_TENSOR_SIZE, ggml_build_forward_expand, ggml_cpy};
 
 use crate::model::{ModelContext, ModelLoader};
 
@@ -110,6 +105,95 @@ impl QwenAttention {
         hidden_states: *mut ggml_tensor,
         n_past: i32,
     ) -> *mut ggml_tensor {
+        let cb = ctx.ctx_b.unwrap();
+        let hidden_size = unsafe { (*hidden_states).ne[0] };
+        let qlen = unsafe { (*hidden_states).ne[1] };
+        let head_size = hidden_size / self.num_attention_heads;
+        let rope_dim = head_size;
+        let mqa_scale = self.num_attention_heads / self.num_kv_heads;
+        let qkv = self.c_attn.forward(ctx, hidden_states);
+
+        let mut query_layer = unsafe {
+            let qkv_size = ggml_element_size(qkv);
+            ggml_view_3d(
+                cb,
+                qkv,
+                head_size,
+                self.num_attention_heads,
+                qlen,
+                head_size as usize * qkv_size,
+                (*qkv).nb[1],
+                0,
+            )
+        };
+        query_layer =
+            unsafe { ggml_rope_inplace(cb, query_layer, n_past, rope_dim as c_int, 2, 0) };
+        query_layer = unsafe {
+            let p = ggml_permute(cb, query_layer, 0, 2, 1, 3);
+            ggml_cont(cb, p)
+        };
+        query_layer = unsafe {
+            ggml_reshape_3d(
+                cb,
+                query_layer,
+                head_size,
+                mqa_scale * qlen,
+                self.num_kv_heads,
+            )
+        };
+
+        let mut key_layer = unsafe {
+            let qkv_size = ggml_element_size(qkv);
+            ggml_view_3d(
+                cb,
+                qkv,
+                head_size,
+                self.num_kv_heads,
+                qlen,
+                head_size as usize * qkv_size,
+                (*qkv).nb[1],
+                hidden_size as usize * qkv_size,
+            )
+        };
+        key_layer = unsafe { ggml_rope_inplace(cb, key_layer, n_past, rope_dim as c_int, 2, 0) };
+        key_layer = unsafe { ggml_permute(cb, key_layer, 0, 2, 1, 3) };
+
+        let mut value_layer = unsafe {
+            let qkv_size = ggml_element_size(qkv);
+            ggml_view_3d(
+                cb,
+                qkv,
+                head_size,
+                self.num_kv_heads,
+                qlen,
+                head_size as usize * qkv_size,
+                (*qkv).nb[1],
+                (hidden_size as usize + head_size as usize * self.num_kv_heads as usize) * qkv_size,
+            )
+        };
+        value_layer = unsafe { ggml_permute(cb, value_layer, 1, 2, 0, 3) };
+
+        let k_cache_view = unsafe {
+            let k_cache_size = ggml_element_size(self.k_cache);
+            ggml_view_3d(
+                cb,
+                self.k_cache,
+                head_size,
+                qlen,
+                self.num_kv_heads,
+                (*self.k_cache).nb[1],
+                (*self.k_cache).nb[2],
+                n_past as usize * head_size as usize * k_cache_size,
+            )
+        };
+
+        unsafe {
+            let cpy = ggml_cpy(cb, key_layer, k_cache_view);
+            // todo gf init?
+            ggml_build_forward_expand(ctx.gf.unwrap(), cpy)
+        }
+
+
         todo!()
     }
 }
