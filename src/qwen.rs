@@ -1,24 +1,27 @@
 use std::collections::HashMap;
-use std::ffi::c_int;
+use std::ffi::{c_int, c_void};
 use std::fmt::Debug;
 use std::fs;
 use std::ptr::null_mut;
+use std::slice::from_raw_parts_mut;
 
 use base64::engine::general_purpose;
 use base64::Engine;
 use bytemuck_derive::{Pod, Zeroable};
 use ggml_sys_bleedingedge::{
-    ggml_add_inplace, ggml_build_forward_expand, ggml_cont, ggml_cpy, ggml_diag_mask_inf_inplace,
-    ggml_element_size, ggml_get_rows, ggml_init, ggml_init_params, ggml_mul_inplace, ggml_mul_mat,
-    ggml_new_f32, ggml_new_tensor_1d, ggml_new_tensor_2d, ggml_new_tensor_3d, ggml_permute,
-    ggml_reshape_2d, ggml_reshape_3d, ggml_rms_norm, ggml_rms_norm_inplace, ggml_rope_inplace,
-    ggml_scale_inplace, ggml_scratch, ggml_set_scratch, ggml_silu_inplace, ggml_soft_max_inplace,
-    ggml_tensor, ggml_type, ggml_type_GGML_TYPE_F16, ggml_type_GGML_TYPE_F32, ggml_type_size,
-    ggml_view_1d, ggml_view_3d, GGML_OBJECT_SIZE, GGML_TENSOR_SIZE,
+    ggml_add_inplace, ggml_backend_GGML_BACKEND_CPU, ggml_build_forward_expand, ggml_cgraph,
+    ggml_cont, ggml_cpu_has_blas, ggml_cpu_has_gpublas, ggml_cpy, ggml_diag_mask_inf_inplace,
+    ggml_element_size, ggml_get_rows, ggml_graph_compute, ggml_graph_plan, ggml_init,
+    ggml_init_params, ggml_mul_inplace, ggml_mul_mat, ggml_nbytes, ggml_new_f32,
+    ggml_new_tensor_1d, ggml_new_tensor_2d, ggml_new_tensor_3d, ggml_permute, ggml_reshape_2d,
+    ggml_reshape_3d, ggml_rms_norm, ggml_rms_norm_inplace, ggml_rope_inplace, ggml_scale_inplace,
+    ggml_scratch, ggml_set_scratch, ggml_silu_inplace, ggml_soft_max_inplace, ggml_tensor,
+    ggml_type, ggml_type_GGML_TYPE_F16, ggml_type_GGML_TYPE_F32, ggml_type_GGML_TYPE_I32,
+    ggml_type_size, ggml_view_1d, ggml_view_3d, GGML_OBJECT_SIZE, GGML_TENSOR_SIZE,
 };
 use tiktoken_rs::CoreBPE;
 
-use crate::model::ModelContext;
+use crate::model::{GenerationConfig, ModelContext};
 
 const MB: usize = 1024 * 1024;
 const MODEL_MEM_SIZE: usize = 512 * MB;
@@ -87,8 +90,8 @@ impl QwenTokenizer {
         self.bpe.encode_with_special_tokens(text)
     }
 
-    pub fn decode(&self, ids: Vec<usize>) -> String {
-        let p = ids
+    pub fn decode(&self, ids: Vec<usize>) -> anyhow::Result<String> {
+        let p:Vec<usize> = ids
             .into_iter()
             .filter(|id| {
                 *id != self.im_start_id as usize
@@ -96,7 +99,10 @@ impl QwenTokenizer {
                     && *id != self.eos_token_id as usize
             })
             .collect();
-        self.bpe.decode(p).expect("decode error")
+        if p.is_empty() { 
+            return Ok("".to_owned())
+        }
+        self.bpe.decode(p)
     }
 }
 
@@ -576,17 +582,16 @@ impl QwenForCausalLM {
     }
     fn forward(
         &self,
-        ctx: &ModelContext,
         input_ids: *mut ggml_tensor,
         n_past: i64,
         // n_ctx: i32,
     ) -> *mut ggml_tensor {
-        let mut output = self.transformer.forward(ctx, input_ids, n_past);
+        let mut output = self.transformer.forward(&self.ctx, input_ids, n_past);
         unsafe {
             if (*input_ids).ne[0] > 1 {
                 let output_size = ggml_element_size(output);
                 output = ggml_view_1d(
-                    ctx.ctx_b.unwrap(),
+                    self.ctx.ctx_b.unwrap(),
                     output,
                     self.config.hidden_size as i64,
                     ((*input_ids).ne[0] - 1) as usize
@@ -595,10 +600,76 @@ impl QwenForCausalLM {
                 );
             }
         }
-        self.lm_head.forward(ctx, output)
+        self.lm_head.forward(&self.ctx, output)
     }
 
-    fn generate_next_token(&self) {}
+    pub fn generate_next_token(
+        &mut self,
+        input_ids: &Vec<usize>,
+        config: &GenerationConfig,
+        n_past: i64,
+        n_ctx: i64,
+    ) -> i32 {
+        let b = unsafe {
+            ggml_init(ggml_init_params {
+                mem_size: self.ctx.compute_buffer.len(),
+                // todo error?
+                mem_buffer: self.ctx.compute_buffer.as_mut_ptr() as *mut c_void,
+                no_alloc: false,
+            })
+        };
+        self.ctx.ctx_b = Some(b);
+        let gct: *mut ggml_cgraph = &mut ggml_cgraph {
+            n_nodes: 0,
+            n_leafs: 0,
+            nodes: [null_mut(); 4096],
+            grads: [null_mut(); 4096],
+            leafs: [null_mut(); 4096],
+            visited_hash_table: [null_mut(); 8273usize],
+            perf_runs: 0,
+            perf_cycles: 0,
+            perf_time_us: 0,
+        };
+
+        // todo empty?
+        self.ctx.gf = Some(gct);
+        let mut n_threads = config.num_threads;
+        let curr_input_ids_size = input_ids.len() - n_past as usize;
+        if curr_input_ids_size >= 32
+            && unsafe { ggml_cpu_has_blas() == 1 }
+            && !unsafe { ggml_cpu_has_gpublas() == 1 }
+        {
+            n_threads = 1;
+        }
+
+        let curr_input_ids = unsafe {
+            ggml_new_tensor_1d(
+                self.ctx.ctx_b.unwrap(),
+                ggml_type_GGML_TYPE_I32,
+                curr_input_ids_size as i64,
+            )
+        };
+
+        let length = unsafe { ggml_nbytes(curr_input_ids) };
+
+        let mut lm_logits = self.forward(curr_input_ids, n_past);
+        unsafe {
+            (*lm_logits).backend = ggml_backend_GGML_BACKEND_CPU;
+            ggml_build_forward_expand(self.ctx.gf.unwrap(), lm_logits);
+
+            // let plan = &mut ggml_graph_plan(self.ctx.gf.unwrap(), n_threads);
+            // todo ggml_graph_compute_helper? compile error
+            // ggml_graph_compute(self.ctx.gf.unwrap(), plan);
+
+            let vocab_size = (*lm_logits).ne[0];
+            // let next_token_logits = (*lm_logits).data as *mut Vec<f32>;
+
+            let next_token_logits: &mut [f32] =
+                from_raw_parts_mut((*lm_logits).data as *mut f32, vocab_size as usize);
+
+            find_max_index(next_token_logits) as i32
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -678,4 +749,13 @@ fn parse(line: &str) -> anyhow::Result<(Vec<u8>, usize)> {
     let decode = general_purpose::STANDARD.decode(left)?;
     let value = v[1].parse::<usize>()?;
     Ok((decode, value))
+}
+
+fn find_max_index(array: &[f32]) -> usize {
+    array
+        .iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+        .map(|(index, _)| index)
+        .unwrap()
 }

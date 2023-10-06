@@ -86,14 +86,14 @@ impl MappedFile {
 struct Pipeline {}
 
 #[derive(Debug)]
-struct GenerationConfig {
+pub struct GenerationConfig {
     max_length: i64,
     do_sample: bool,
     top_k: i32,
     top_p: f32,
     temperature: f32,
     repetition_penalty: f32,
-    num_threads: i32,
+    pub num_threads: i32,
 }
 
 impl Default for GenerationConfig {
